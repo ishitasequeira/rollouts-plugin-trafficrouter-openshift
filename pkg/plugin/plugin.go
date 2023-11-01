@@ -70,7 +70,7 @@ func (r *RpcPlugin) SetWeight(rollout *v1alpha1.Rollout, desiredWeight int32, ad
 	for _, route := range openshift.Routes {
 		slog.Debug("updating route", slog.String("name", route))
 
-		if err := r.updateRoute(ctx, route, rollout, desiredWeight); err != nil {
+		if err := r.updateRoute(ctx, route, rollout, desiredWeight, rollout.Namespace); err != nil {
 			slog.Error("failed to update route", slog.String("name", route), slog.Any("err", err))
 			return pluginTypes.RpcError{ErrorString: err.Error()}
 		}
@@ -123,7 +123,7 @@ func validateRolloutParameters(rollout *v1alpha1.Rollout) error {
 // Update default backend weight,
 // remove alternateBackends if weight is 0,
 // otherwise update alternateBackends
-func (r *RpcPlugin) updateRoute(ctx context.Context, routeName string, rollout *v1alpha1.Rollout, desiredWeight int32) error {
+func (r *RpcPlugin) updateRoute(ctx context.Context, routeName string, rollout *v1alpha1.Rollout, desiredWeight int32, namespace string) error {
 	// get the route
 	route, err := r.getRoute(ctx, rollout.Namespace, routeName)
 	if err != nil {
@@ -134,15 +134,32 @@ func (r *RpcPlugin) updateRoute(ctx context.Context, routeName string, rollout *
 			msg := fmt.Sprintf("Route %q not found", routeName)
 			slog.Debug("OpenshiftRouteNotFound", msg)
 		}
+
+		// update default backend weight if weight is different
+		altWeight := 100 - desiredWeight
+		if *route.Spec.To.Weight == altWeight {
+			// r.Cfg.Recorder.Eventf(r.Cfg.Rollout, record.EventOptions{EventReason: "UpdatedRoute"}, "Route `%s` already set to desiredWeight '%d'", routeName, desiredWeight)
+			return nil
+		}
+
+		slog.Info("updating default backend weight to %d", altWeight)
+		route.Spec.To.Weight = &altWeight
+		if desiredWeight == 0 {
+			slog.Info("deleting alternateBackends")
+			route.Spec.AlternateBackends = nil
+		} else {
+			slog.Info("updating alternate backend weight to %d", desiredWeight)
+			route.Spec.AlternateBackends = []routev1.RouteTargetReference{{
+				Kind:   "Service",
+				Name:   routeName,
+				Weight: &desiredWeight,
+			}}
+		}
+		_, err = r.dynamicClient.Resource(routev1.GroupVersion.WithResource("Route")).Namespace(namespace).Get(ctx, routeName, metav1.GetOptions{})
+
 		return err
 	}
 
-	// slog.Debug("old weight", slog.Int64("canary", canarySvc.Weight), slog.Int64("stable", stableSvc.Weight))
-
-	// canarySvc.Weight = int64(desiredWeight)
-	// stableSvc.Weight = 100 - canarySvc.Weight
-
-	// slog.Debug("new weight", slog.Int64("canary", canarySvc.Weight), slog.Int64("stable", stableSvc.Weight))
 	m, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&route)
 	if err != nil {
 		return err
@@ -173,4 +190,13 @@ func (r *RpcPlugin) getRoute(ctx context.Context, namespace string, routeName st
 	}
 	return &openshiftRoute, nil
 
+}
+
+func getServiceMap(route *routev1.RouteList) map[string]*routev1.Route {
+	svcMap := make(map[string]*routev1.Route)
+	for _, r := range route.Items {
+		svcMap[r.Name] = &r
+	}
+
+	return svcMap
 }
